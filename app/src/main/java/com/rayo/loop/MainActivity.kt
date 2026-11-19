@@ -12,10 +12,12 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.OpenableColumns
+import android.text.InputType
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
+import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -145,8 +147,34 @@ class MainActivity : Activity() {
         var mUri: Uri? = null
         var dIdx = 0
         var kIdx = 2
+        var uIdx = 1
+        val uLabels = listOf("Ringan 480p", "Sedang 720p", "Tinggi (asli)")
+        val uQuality = listOf(1, 2, 0)
+        val uFile = listOf("ringan", "sedang", "tinggi")
+
         val c1 = card(col, "1. Video sumber")
         pickerRow(c1, "video/*", "Belum ada video") { vUri = it }
+
+        val cTrim = card(col, "Potong bagian video (opsional)")
+        val trimRow = LinearLayout(this)
+        trimRow.orientation = LinearLayout.HORIZONTAL
+        val startEt = timeField("Mulai (detik)")
+        val endEt = timeField("Selesai (detik)")
+        val lpA = LinearLayout.LayoutParams(0, WRAP, 1f)
+        lpA.setMargins(0, 0, dp(4), 0)
+        val lpB = LinearLayout.LayoutParams(0, WRAP, 1f)
+        lpB.setMargins(dp(4), 0, 0, 0)
+        trimRow.addView(startEt, lpA)
+        trimRow.addView(endEt, lpB)
+        cTrim.addView(trimRow)
+        val trimNote = TextView(this)
+        trimNote.text = "Kosongkan untuk memakai seluruh video. " +
+            "Pilih awal dan akhir yang gambarnya mirip supaya sambungan loop terasa mulus."
+        trimNote.setTextColor(MUTED)
+        trimNote.textSize = 12f
+        trimNote.setPadding(0, dp(8), 0, 0)
+        cTrim.addView(trimNote)
+
         val c2 = card(col, "2. Durasi hasil")
         choice(c2, durLabels, 0, 3) { dIdx = it }
         val c3 = card(col, "3. Musik / backsound (opsional)")
@@ -159,22 +187,41 @@ class MainActivity : Activity() {
         keep.text = "Campur dengan suara asli video"
         keep.setTextColor(Color.WHITE)
         c3.addView(keep)
+
+        val cSize = card(col, "Ukuran video")
+        choice(cSize, uLabels, 1, 3) { uIdx = it }
+        val sizeNote = TextView(this)
+        sizeNote.text = "Ringan paling kecil dan paling enteng di HP. " +
+            "Tinggi mengikuti kualitas video asli, ukuran file paling besar."
+        sizeNote.setTextColor(MUTED)
+        sizeNote.textSize = 12f
+        sizeNote.setPadding(0, dp(8), 0, 0)
+        cSize.addView(sizeNote)
+
         val c4 = card(col, "Kualitas suara musik")
         choice(c4, q4Labels, 2, 4) { kIdx = it }
         startBtn(col, "MULAI BUAT VIDEO LOOP") {
             val v = vUri
             val m = if (sw.isChecked) mUri else null
+            val sMs = (((startEt.text.toString().trim().toDoubleOrNull()) ?: 0.0) * 1000)
+                .toLong().coerceAtLeast(0L)
+            val eRaw = endEt.text.toString().trim().toDoubleOrNull()
+            val eMs = if (eRaw != null) (eRaw * 1000).toLong() else 0L
             if (v == null) {
                 toast("Pilih video dulu")
             } else if (sw.isChecked && m == null) {
                 toast("Pilih file musiknya")
+            } else if (eMs > 0 && eMs <= sMs) {
+                toast("Waktu selesai harus lebih besar dari waktu mulai")
             } else {
                 start(
                     JobSpec(
                         kind = "video", videoUri = v, audioUri = m,
                         targetMs = durMs[dIdx], audioKbps = q4Vals[kIdx],
                         keepOriginalAudio = keep.isChecked,
-                        label = "video_" + durFile[dIdx]
+                        label = "video_" + durFile[dIdx] + "_" + uFile[uIdx],
+                        trimStartMs = sMs, trimEndMs = eMs,
+                        quality = uQuality[uIdx]
                     )
                 )
             }
@@ -424,6 +471,18 @@ class MainActivity : Activity() {
         c.addView(t)
         parent.addView(c, lp)
         return c
+    }
+
+    private fun timeField(hint: String): EditText {
+        val e = EditText(this)
+        e.hint = hint
+        e.setHintTextColor(MUTED)
+        e.setTextColor(Color.WHITE)
+        e.textSize = 14f
+        e.inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+        e.background = rounded(CHIP, 12)
+        e.setPadding(dp(12), dp(10), dp(12), dp(10))
+        return e
     }
 
     private fun pickerRow(parent: LinearLayout, mime: String, hint: String, onUri: (Uri) -> Unit) {
