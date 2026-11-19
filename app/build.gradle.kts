@@ -5,7 +5,7 @@ plugins {
 
 android {
     namespace = "com.rayo.loop"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.rayo.loop"
@@ -25,7 +25,7 @@ android {
 }
 
 dependencies {
-    implementation("androidx.media3:media3-transformer:1.5.1")
-    implementation("androidx.media3:media3-effect:1.5.1")
-    implementation("androidx.media3:media3-common:1.5.1")
+    implementation("androidx.media3:media3-transformer:1.10.1")
+    implementation("androidx.media3:media3-effect:1.10.1")
+    implementation("androidx.media3:media3-common:1.10.1")
 }
