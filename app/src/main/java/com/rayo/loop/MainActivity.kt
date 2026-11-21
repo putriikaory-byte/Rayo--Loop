@@ -26,6 +26,7 @@ import android.widget.ScrollView
 import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
+import java.util.Locale
 
 class MainActivity : Activity() {
 
@@ -40,6 +41,7 @@ class MainActivity : Activity() {
 
     private val ui = Handler(Looper.getMainLooper())
     private var onPicked: ((Uri) -> Unit)? = null
+    private var analyzing = false
 
     private lateinit var statusCard: LinearLayout
     private lateinit var statusText: TextView
@@ -58,6 +60,18 @@ class MainActivity : Activity() {
     private val q5Vals = listOf(0, 128, 192, 256, 320)
     private val mixLabels = listOf("128 kbps", "192 kbps", "256 kbps", "320 kbps")
     private val mixVals = listOf(128, 192, 256, 320)
+
+    private inner class LoopHolder(val uriOf: () -> Uri?) {
+        var point: LoopPoint? = null
+        var forUri: Uri? = null
+        var sw: Switch? = null
+
+        fun active(): LongArray? {
+            val p = point ?: return null
+            if (sw?.isChecked != true || forUri != uriOf()) return null
+            return longArrayOf(p.startMs, p.endMs)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -140,43 +154,108 @@ class MainActivity : Activity() {
         }
     }
 
+    // ---------- Deteksi loop ----------
+
+    private fun fmt(ms: Long): String {
+        val m = ms / 60000
+        val s = (ms % 60000) / 1000.0
+        return String.format(Locale.US, "%d:%04.1f", m, s)
+    }
+
+    private fun quality(p: Int): String =
+        if (p >= 80) "sangat mulus" else if (p >= 60) "cukup mulus" else "kurang mulus"
+
+    private fun loopCard(parent: LinearLayout, video: Boolean, uriOf: () -> Uri?): LoopHolder {
+        val h = LoopHolder(uriOf)
+        val c = card(
+            parent,
+            if (video) "Deteksi loop otomatis (video)" else "Deteksi loop otomatis (suara)"
+        )
+        c.addView(small("Cari titik awal dan akhir yang menyambung mulus tanpa terjeda."))
+        val result = TextView(this)
+        result.setTextColor(Color.WHITE)
+        result.textSize = 14f
+        result.setPadding(0, dp(6), 0, dp(6))
+        c.addView(result)
+        val sw = Switch(this)
+        sw.text = "Pakai titik loop otomatis"
+        sw.setTextColor(Color.WHITE)
+        sw.isChecked = true
+        sw.visibility = View.GONE
+        h.sw = sw
+        val btn = Button(this)
+        btn.text = "Cari titik loop"
+        btn.setOnClickListener {
+            val u = uriOf()
+            if (u == null) {
+                toast("Pilih file dulu")
+                return@setOnClickListener
+            }
+            if (analyzing) {
+                toast("Masih menganalisis")
+                return@setOnClickListener
+            }
+            analyzing = true
+            btn.isEnabled = false
+            sw.visibility = View.GONE
+            h.point = null
+            result.text = "Menganalisis..."
+            Thread {
+                val say: (String) -> Unit = { m -> runOnUiThread { result.text = m } }
+                val p = try {
+                    if (video) LoopDetector.detectVideo(this, u, say)
+                    else LoopDetector.detectAudio(this, u, say)
+                } catch (e: Exception) {
+                    null
+                }
+                runOnUiThread {
+                    analyzing = false
+                    btn.isEnabled = true
+                    h.point = p
+                    h.forUri = u
+                    if (p == null) {
+                        result.text = "Tidak ketemu titik loop yang cocok. Coba file lain."
+                    } else {
+                        result.text = "Loop: " + fmt(p.startMs) + " → " + fmt(p.endMs) +
+                            "\nKemulusan: " + p.similarity + "% (" + quality(p.similarity) + ")"
+                        sw.visibility = View.VISIBLE
+                    }
+                }
+            }.start()
+        }
+        c.addView(btn)
+        c.addView(sw)
+        return h
+    }
+
     // ---------- Tab ----------
 
     private fun buildVideoTab(): View = page { col ->
         var vUri: Uri? = null
         var mUri: Uri? = null
         var dIdx = 0
+        var hIdx = 1
         var kIdx = 2
-        var uIdx = 1
-        val uLabels = listOf("Ringan 480p", "Sedang 720p", "Tinggi (asli)")
-        val uQuality = listOf(1, 2, 0)
-        val uFile = listOf("ringan", "sedang", "tinggi")
-
+        val hVals = listOf(480, 720, 0)
         val c1 = card(col, "1. Video sumber")
         pickerRow(c1, "video/*", "Belum ada video") { vUri = it }
+        val vHold = loopCard(col, true) { vUri }
 
-        val cTrim = card(col, "Potong bagian video (opsional)")
-        val trimRow = LinearLayout(this)
-        trimRow.orientation = LinearLayout.HORIZONTAL
-        val startEt = timeField("Mulai (detik)")
-        val endEt = timeField("Selesai (detik)")
-        val lpA = LinearLayout.LayoutParams(0, WRAP, 1f)
-        lpA.setMargins(0, 0, dp(4), 0)
-        val lpB = LinearLayout.LayoutParams(0, WRAP, 1f)
-        lpB.setMargins(dp(4), 0, 0, 0)
-        trimRow.addView(startEt, lpA)
-        trimRow.addView(endEt, lpB)
-        cTrim.addView(trimRow)
-        val trimNote = TextView(this)
-        trimNote.text = "Kosongkan untuk memakai seluruh video. " +
-            "Pilih awal dan akhir yang gambarnya mirip supaya sambungan loop terasa mulus."
-        trimNote.setTextColor(MUTED)
-        trimNote.textSize = 12f
-        trimNote.setPadding(0, dp(8), 0, 0)
-        cTrim.addView(trimNote)
+        val cT = card(col, "Potong bagian video (opsional)")
+        val row = LinearLayout(this)
+        row.orientation = LinearLayout.HORIZONTAL
+        val etS = numField("Mulai (detik)")
+        val etE = numField("Selesai (detik)")
+        val lpS = LinearLayout.LayoutParams(0, WRAP, 1f)
+        lpS.setMargins(0, 0, dp(6), 0)
+        row.addView(etS, lpS)
+        row.addView(etE, LinearLayout.LayoutParams(0, WRAP, 1f))
+        cT.addView(row)
+        cT.addView(small("Kosongkan untuk memakai seluruh video. Diabaikan jika deteksi loop otomatis dipakai."))
 
         val c2 = card(col, "2. Durasi hasil")
         choice(c2, durLabels, 0, 3) { dIdx = it }
+
         val c3 = card(col, "3. Musik / backsound (opsional)")
         val sw = Switch(this)
         sw.text = "Tambah musik loop"
@@ -187,41 +266,38 @@ class MainActivity : Activity() {
         keep.text = "Campur dengan suara asli video"
         keep.setTextColor(Color.WHITE)
         c3.addView(keep)
+        val mHold = loopCard(col, false) { mUri }
 
-        val cSize = card(col, "Ukuran video")
-        choice(cSize, uLabels, 1, 3) { uIdx = it }
-        val sizeNote = TextView(this)
-        sizeNote.text = "Ringan paling kecil dan paling enteng di HP. " +
-            "Tinggi mengikuti kualitas video asli, ukuran file paling besar."
-        sizeNote.setTextColor(MUTED)
-        sizeNote.textSize = 12f
-        sizeNote.setPadding(0, dp(8), 0, 0)
-        cSize.addView(sizeNote)
-
+        val c5 = card(col, "Ukuran video")
+        choice(c5, listOf("Ringan 480p", "Sedang 720p", "Tinggi (asli)"), 1, 3) { hIdx = it }
+        c5.addView(small("Ringan = file kecil. Tinggi = kualitas asli dan proses paling cepat."))
         val c4 = card(col, "Kualitas suara musik")
         choice(c4, q4Labels, 2, 4) { kIdx = it }
+
         startBtn(col, "MULAI BUAT VIDEO LOOP") {
             val v = vUri
-            val m = if (sw.isChecked) mUri else null
-            val sMs = (((startEt.text.toString().trim().toDoubleOrNull()) ?: 0.0) * 1000)
-                .toLong().coerceAtLeast(0L)
-            val eRaw = endEt.text.toString().trim().toDoubleOrNull()
-            val eMs = if (eRaw != null) (eRaw * 1000).toLong() else 0L
+            val useMusic = sw.isChecked
+            val m = if (useMusic) mUri else null
             if (v == null) {
                 toast("Pilih video dulu")
-            } else if (sw.isChecked && m == null) {
+            } else if (useMusic && m == null) {
                 toast("Pilih file musiknya")
-            } else if (eMs > 0 && eMs <= sMs) {
-                toast("Waktu selesai harus lebih besar dari waktu mulai")
             } else {
+                val s = etS.text.toString().toDoubleOrNull()
+                val e = etE.text.toString().toDoubleOrNull()
+                val manual = if (s != null || e != null) {
+                    longArrayOf(((s ?: 0.0) * 1000).toLong(), ((e ?: 0.0) * 1000).toLong())
+                } else null
+                val dv = vHold.active()
+                val dm = if (m != null) mHold.active() else null
                 start(
                     JobSpec(
                         kind = "video", videoUri = v, audioUri = m,
                         targetMs = durMs[dIdx], audioKbps = q4Vals[kIdx],
-                        keepOriginalAudio = keep.isChecked,
-                        label = "video_" + durFile[dIdx] + "_" + uFile[uIdx],
-                        trimStartMs = sMs, trimEndMs = eMs,
-                        quality = uQuality[uIdx]
+                        keepOriginalAudio = keep.isChecked, heightPx = hVals[hIdx],
+                        vClip = dv ?: manual, aClip = dm,
+                        seamless = dv != null || dm != null,
+                        label = "video_" + durFile[dIdx]
                     )
                 )
             }
@@ -234,6 +310,7 @@ class MainActivity : Activity() {
         var kIdx = 2
         val c1 = card(col, "1. Audio sumber")
         pickerRow(c1, "audio/*", "Belum ada audio") { aUri = it }
+        val hold = loopCard(col, false) { aUri }
         val c2 = card(col, "2. Durasi hasil")
         choice(c2, durLabels, 0, 3) { dIdx = it }
         val c3 = card(col, "3. Kualitas suara")
@@ -243,10 +320,12 @@ class MainActivity : Activity() {
             if (a == null) {
                 toast("Pilih audio dulu")
             } else {
+                val da = hold.active()
                 start(
                     JobSpec(
                         kind = "audio", audioUri = a, targetMs = durMs[dIdx],
-                        audioKbps = q5Vals[kIdx], label = "audio_" + durFile[dIdx]
+                        audioKbps = q5Vals[kIdx], aClip = da, seamless = da != null,
+                        label = "audio_" + durFile[dIdx]
                     )
                 )
             }
@@ -260,8 +339,10 @@ class MainActivity : Activity() {
         var kIdx = 1
         val c1 = card(col, "1. Sound pertama")
         pickerRow(c1, "audio/*", "Belum ada audio") { aUri = it }
+        val holdA = loopCard(col, false) { aUri }
         val c2 = card(col, "2. Sound kedua")
         pickerRow(c2, "audio/*", "Belum ada audio") { bUri = it }
+        val holdB = loopCard(col, false) { bUri }
         val c3 = card(col, "3. Durasi hasil")
         choice(c3, durLabels, 0, 3) { dIdx = it }
         val c4 = card(col, "4. Kualitas suara")
@@ -272,10 +353,14 @@ class MainActivity : Activity() {
             if (a == null || b == null) {
                 toast("Pilih kedua sound dulu")
             } else {
+                val da = holdA.active()
+                val db = holdB.active()
                 start(
                     JobSpec(
                         kind = "mix", audioUri = a, audio2Uri = b, targetMs = durMs[dIdx],
-                        audioKbps = mixVals[kIdx], label = "mix_" + durFile[dIdx]
+                        audioKbps = mixVals[kIdx], aClip = da, a2Clip = db,
+                        seamless = da != null || db != null,
+                        label = "mix_" + durFile[dIdx]
                     )
                 )
             }
@@ -297,11 +382,10 @@ class MainActivity : Activity() {
         choice(c3, listOf("Asli", "1080p", "720p", "480p"), 0, 4) { rIdx = it }
         val c4 = card(col, "4. Kualitas suara")
         choice(c4, listOf("96 kbps", "128 kbps", "192 kbps"), 1, 3) { kIdx = it }
-        val note = TextView(this)
-        note.text = "Tips: makin kecil ukuran target, makin turun kualitas gambar. " +
-            "Untuk hasil terbaik biarkan resolusi Asli dan pilih ukuran yang tidak terlalu kecil."
-        note.setTextColor(MUTED)
-        note.textSize = 12f
+        val note = small(
+            "Tips: makin kecil ukuran target, makin turun kualitas gambar. " +
+                "Untuk hasil terbaik biarkan resolusi Asli dan pilih ukuran yang tidak terlalu kecil."
+        )
         note.setPadding(dp(4), dp(10), dp(4), 0)
         col.addView(note)
         startBtn(col, "MULAI KOMPRES") {
@@ -327,8 +411,10 @@ class MainActivity : Activity() {
         var kIdx = 1
         val c1 = card(col, "1. Video")
         pickerRow(c1, "video/*", "Belum ada video") { vUri = it }
+        val holdV = loopCard(col, true) { vUri }
         val c2 = card(col, "2. Suara / musik")
         pickerRow(c2, "audio/*", "Belum ada audio") { aUri = it }
+        val holdA = loopCard(col, false) { aUri }
         val c3 = card(col, "3. Samakan durasi dengan")
         choice(c3, listOf("Terpanjang", "Video", "Audio"), 0, 3) { mIdx = it }
         val keep = Switch(this)
@@ -343,10 +429,13 @@ class MainActivity : Activity() {
             if (v == null || a == null) {
                 toast("Pilih video dan suara dulu")
             } else {
+                val dv = holdV.active()
+                val da = holdA.active()
                 start(
                     JobSpec(
                         kind = "combine", videoUri = v, audioUri = a, matchMode = mIdx,
                         audioKbps = mixVals[kIdx], keepOriginalAudio = keep.isChecked,
+                        vClip = dv, aClip = da, seamless = dv != null || da != null,
                         label = "gabung"
                     )
                 )
@@ -473,7 +562,16 @@ class MainActivity : Activity() {
         return c
     }
 
-    private fun timeField(hint: String): EditText {
+    private fun small(text: String): TextView {
+        val t = TextView(this)
+        t.text = text
+        t.setTextColor(MUTED)
+        t.textSize = 12f
+        t.setPadding(dp(2), dp(4), dp(2), dp(2))
+        return t
+    }
+
+    private fun numField(hint: String): EditText {
         val e = EditText(this)
         e.hint = hint
         e.setHintTextColor(MUTED)
@@ -481,7 +579,7 @@ class MainActivity : Activity() {
         e.textSize = 14f
         e.inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
         e.background = rounded(CHIP, 12)
-        e.setPadding(dp(12), dp(10), dp(12), dp(10))
+        e.setPadding(dp(12), dp(12), dp(12), dp(12))
         return e
     }
 
