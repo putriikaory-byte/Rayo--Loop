@@ -48,11 +48,11 @@ data class JobSpec(
     val targetMb: Int = 0,
     val heightPx: Int = 0,
     val label: String = "hasil",
-    // Baru: potong video (milidetik). Kosong = pakai seluruh video.
-    val trimStartMs: Long = 0L,
-    val trimEndMs: Long = 0L,
-    // Baru: 0 = Tinggi (asli), 1 = Ringan (480p), 2 = Sedang (720p)
-    val quality: Int = 0
+    val vClip: LongArray? = null,
+    val aClip: LongArray? = null,
+    val a2Clip: LongArray? = null,
+    val seamless: Boolean = false,
+    val vFullMs: Long = 0L
 )
 
 object JobState {
@@ -70,11 +70,13 @@ class ProcessService : Service() {
     private var transformer: Transformer? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var tempFile: File? = null
-    private var stageClip: File? = null
-    private var stage = 0
+    private var segFile: File? = null
     private var outName = ""
     private var isAudioOut = false
     private var usedFast = false
+    private var usedSegment = false
+    private var phase = 0
+    private var vFullField = 0L
     private var currentSpec: JobSpec? = null
     private val progressHolder = ProgressHolder()
 
@@ -82,9 +84,14 @@ class ProcessService : Service() {
         override fun run() {
             val t = transformer ?: return
             if (t.getProgress(progressHolder) == Transformer.PROGRESS_STATE_AVAILABLE) {
-                JobState.percent = progressHolder.progress
-                val label = if (stage == 1) "Menyiapkan potongan" else "Memproses"
-                notifyProgress("$label ${JobState.percent}%", JobState.percent)
+                val raw = progressHolder.progress
+                val pct = when {
+                    usedSegment && phase == 1 -> raw / 4
+                    usedSegment -> 25 + raw * 3 / 4
+                    else -> raw
+                }
+                JobState.percent = pct
+                notifyProgress("Memproses $pct%", pct)
             }
             handler.postDelayed(this, 700)
         }
@@ -92,7 +99,7 @@ class ProcessService : Service() {
 
     private val listener = object : Transformer.Listener {
         override fun onCompleted(composition: Composition, exportResult: ExportResult) {
-            onExportDone()
+            if (phase == 1) afterSegment() else onExportDone()
         }
 
         override fun onError(
@@ -100,7 +107,15 @@ class ProcessService : Service() {
             exportResult: ExportResult,
             exportException: ExportException
         ) {
-            onExportFailed(exportException)
+            if (phase == 1) {
+                handler.removeCallbacks(poll)
+                finishWithError(
+                    "Gagal menyiapkan video: " +
+                        (exportException.message ?: exportException.errorCodeName)
+                )
+            } else {
+                onExportFailed(exportException)
+            }
         }
     }
 
@@ -146,148 +161,118 @@ class ProcessService : Service() {
         JobState.percent = 0
         JobState.message = "Menyiapkan..."
         currentSpec = spec
-        stage = 0
         isAudioOut = spec.kind == "audio" || spec.kind == "mix"
         outName = makeName(spec)
-        tempFile = File(externalCacheDir ?: cacheDir, "rayo_tmp." + (if (isAudioOut) "m4a" else "mp4"))
+        val dir = externalCacheDir ?: cacheDir
+        tempFile = File(dir, "rayo_tmp." + (if (isAudioOut) "m4a" else "mp4"))
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "RayoLoop:job").apply {
             acquire(6 * 60 * 60 * 1000L)
         }
         try {
-            val fast = spec.kind == "video" || spec.kind == "combine" ||
-                (spec.kind == "audio" && spec.audioKbps == 0)
-            if (needsPrepare(spec)) {
-                prepareClip(spec)
-            } else {
-                runJob(spec, fast)
-            }
+            begin(spec)
         } catch (e: Exception) {
             finishWithError(e.message ?: "Gagal memulai")
         }
         return START_NOT_STICKY
     }
 
-    // ---------- Tahap 1: siapkan potongan klip (potong + kompres) ----------
+    // ---------- Alur tugas ----------
 
-    private fun needsPrepare(spec: JobSpec): Boolean {
-        if (spec.kind != "video") return false
-        val uri = spec.videoUri ?: return false
-        val trimmed = spec.trimStartMs > 0 || spec.trimEndMs > spec.trimStartMs
-        val d = durationMs(uri)
-        return trimmed || spec.quality > 0 || d in 1..19_999
+    private fun defaultFast(spec: JobSpec): Boolean = when (spec.kind) {
+        "video", "combine" -> true
+        "audio" -> spec.audioKbps == 0 && !spec.seamless
+        else -> false
     }
 
-    private fun qualityShortSide(q: Int): Int = when (q) {
-        1 -> 480
-        2 -> 720
-        else -> 0
-    }
-
-    private fun qualityBitrate(spec: JobSpec): Int {
-        val uri = spec.videoUri ?: return 0
-        val orig = bitrateOf(uri)
-        val target = when (spec.quality) {
-            1 -> 1_500_000L
-            2 -> 3_000_000L
-            else -> if (orig > 0) orig else 8_000_000L
-        }
-        val capped = if (orig > 0) minOf(target, orig) else target
-        return capped.coerceIn(300_000L, 20_000_000L).toInt()
-    }
-
-    private fun scaledHeight(uri: Uri, shortSide: Int): Int {
-        if (shortSide <= 0) return 0
-        val r = MediaMetadataRetriever()
-        try {
-            r.setDataSource(this, uri)
-            var w = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
-                ?.toIntOrNull() ?: return 0
-            var h = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
-                ?.toIntOrNull() ?: return 0
-            val rot = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)
-                ?.toIntOrNull() ?: 0
-            if (rot == 90 || rot == 270) {
-                val t = w
-                w = h
-                h = t
+    private fun begin(spec: JobSpec) {
+        usedSegment = false
+        val vu = spec.videoUri
+        if ((spec.kind == "video" || spec.kind == "combine") && vu != null) {
+            val dur = durationMs(vu)
+            val c = fixClip(spec.vClip, dur)
+            val clipNeeded = c != null && !(c[0] < 100L && c[1] >= dur - 100L)
+            val scaleNeeded = spec.heightPx > 0 && videoHeight(vu) > spec.heightPx
+            if (clipNeeded || scaleNeeded) {
+                usedSegment = true
+                startSegment(spec, if (clipNeeded) c else null, dur)
+                return
             }
-            val short = minOf(w, h)
-            if (short <= shortSide) return 0
-            val newH = Math.round(h.toDouble() * shortSide / short).toInt()
-            return newH - (newH % 2)
-        } finally {
-            r.release()
         }
+        phase = 2
+        runJob(spec, defaultFast(spec))
     }
 
-    private fun prepareClip(spec: JobSpec) {
-        usedFast = false
-        stage = 1
+    // Tahap 1: potong dan/atau perkecil video sekali saja
+    private fun startSegment(spec: JobSpec, clip: LongArray?, fullMs: Long) {
+        phase = 1
+        vFullField = fullMs
         val uri = spec.videoUri ?: throw IllegalArgumentException("Video belum dipilih")
-        val srcDur = durationMs(uri)
-        require(srcDur > 0) { "Durasi video tidak terbaca" }
-        val start = spec.trimStartMs.coerceIn(0L, srcDur)
-        val end = if (spec.trimEndMs > start) minOf(spec.trimEndMs, srcDur) else srcDur
-        val segLen = end - start
-        require(segLen >= 1000) { "Potongan terlalu pendek (minimal 1 detik)" }
-        val repeats = ((30_000L + segLen - 1) / segLen).toInt().coerceIn(1, 60)
+        val seg = File(externalCacheDir ?: cacheDir, "rayo_seg.mp4")
+        if (seg.exists()) seg.delete()
+        segFile = seg
+        val origH = videoHeight(uri)
+        val scale = spec.heightPx > 0 && origH > spec.heightPx
+        val ratio = if (scale) spec.heightPx.toDouble() / origH else 1.0
+        val orig = bitrateOf(uri)
+        val base = if (orig > 0) orig.toDouble() else 8_000_000.0
+        val br = (base * 1.2 * ratio * ratio).coerceIn(1_000_000.0, 40_000_000.0).toInt()
 
-        val clip = File(externalCacheDir ?: cacheDir, "rayo_clip.mp4")
-        if (clip.exists()) clip.delete()
-        stageClip = clip
-
-        val removeAudio = spec.audioUri != null && !spec.keepOriginalAudio
-        val newH = scaledHeight(uri, qualityShortSide(spec.quality))
-        val items = ArrayList<EditedMediaItem>()
-        repeat(repeats) {
-            val mb = MediaItem.Builder().setUri(uri)
-            if (start > 0 || end < srcDur) {
-                mb.setClippingConfiguration(
-                    MediaItem.ClippingConfiguration.Builder()
-                        .setStartPositionMs(start)
-                        .setEndPositionMs(end)
-                        .build()
-                )
-            }
-            val eb = EditedMediaItem.Builder(mb.build())
-            if (removeAudio) eb.setRemoveAudio(true)
-            if (newH > 0) {
-                eb.setEffects(
-                    Effects(emptyList(), listOf<Effect>(Presentation.createForHeight(newH)))
-                )
-            }
-            items.add(eb.build())
+        val mb = MediaItem.Builder().setUri(uri)
+        if (clip != null) {
+            mb.setClippingConfiguration(
+                MediaItem.ClippingConfiguration.Builder()
+                    .setStartPositionMs(clip[0])
+                    .setEndPositionMs(clip[1])
+                    .build()
+            )
         }
-        val seq = EditedMediaItemSequence.withAudioAndVideoFrom(items)
-        JobState.message = "Menyiapkan potongan video..."
-        val t = buildTransformer(spec)
+        val eb = EditedMediaItem.Builder(mb.build())
+        if (scale) {
+            eb.setEffects(
+                Effects(emptyList(), listOf<Effect>(Presentation.createForHeight(spec.heightPx)))
+            )
+        }
+        val enc = DefaultEncoderFactory.Builder(this)
+            .setRequestedVideoEncoderSettings(VideoEncoderSettings.Builder().setBitrate(br).build())
+            .build()
+        val t = Transformer.Builder(this)
+            .setEncoderFactory(enc)
+            .setVideoMimeType(MimeTypes.VIDEO_H264)
+            .setAudioMimeType(MimeTypes.AUDIO_AAC)
+            .addListener(listener)
+            .build()
         transformer = t
-        t.start(Composition.Builder(seq).build(), clip.absolutePath)
-        handler.removeCallbacks(poll)
-        handler.postDelayed(poll, 700)
+        JobState.message = "Menyiapkan potongan video..."
+        t.start(eb.build(), seg.absolutePath)
+        schedulePoll()
     }
 
-    private fun startLoopFromClip() {
+    // Tahap 2: ulang potongan itu tanpa encode ulang
+    private fun afterSegment() {
         handler.removeCallbacks(poll)
-        stage = 0
-        val spec = currentSpec
-        val clip = stageClip
-        if (spec == null || clip == null || !clip.exists()) {
-            finishWithError("Potongan video gagal dibuat")
+        val seg = segFile
+        val s = currentSpec
+        if (seg == null || s == null) {
+            finishWithError("Potongan video hilang")
             return
         }
-        val loopSpec = spec.copy(videoUri = Uri.fromFile(clip))
-        currentSpec = loopSpec
-        JobState.percent = 0
+        val ns = s.copy(
+            videoUri = Uri.fromFile(seg), vClip = null, heightPx = 0, vFullMs = vFullField
+        )
+        currentSpec = ns
+        phase = 2
         try {
-            runJob(loopSpec, true)
+            runJob(ns, defaultFast(ns))
         } catch (e: Exception) {
             finishWithError(e.message ?: "Gagal")
         }
     }
 
-    // ---------- Menjalankan tugas ----------
+    private fun schedulePoll() {
+        handler.removeCallbacks(poll)
+        handler.postDelayed(poll, 700)
+    }
 
     private fun runJob(spec: JobSpec, fastMode: Boolean) {
         usedFast = fastMode
@@ -301,32 +286,25 @@ class ProcessService : Service() {
         } else {
             t.start(buildComposition(spec, fastMode), out.absolutePath)
         }
-        handler.removeCallbacks(poll)
-        handler.postDelayed(poll, 700)
+        schedulePoll()
     }
 
     private fun buildTransformer(spec: JobSpec): Transformer {
+        val kb = if (spec.audioKbps <= 0) 192 else spec.audioKbps.coerceAtLeast(64)
         val enc = DefaultEncoderFactory.Builder(this)
             .setRequestedAudioEncoderSettings(
-                AudioEncoderSettings.Builder()
-                    .setBitrate(spec.audioKbps.coerceAtLeast(64) * 1000)
-                    .build()
+                AudioEncoderSettings.Builder().setBitrate(kb * 1000).build()
             )
-        val videoBps = when {
-            spec.kind == "compress" -> compressBitrate(spec)
-            spec.kind == "video" && (spec.quality > 0 || stage == 1) -> qualityBitrate(spec)
-            else -> 0
-        }
-        if (videoBps > 0) {
+        if (spec.kind == "compress") {
             enc.setRequestedVideoEncoderSettings(
-                VideoEncoderSettings.Builder().setBitrate(videoBps).build()
+                VideoEncoderSettings.Builder().setBitrate(compressBitrate(spec)).build()
             )
         }
         val tb = Transformer.Builder(this)
             .setEncoderFactory(enc.build())
             .setAudioMimeType(MimeTypes.AUDIO_AAC)
             .addListener(listener)
-        if (videoBps > 0) tb.setVideoMimeType(MimeTypes.VIDEO_H264)
+        if (spec.kind == "compress") tb.setVideoMimeType(MimeTypes.VIDEO_H264)
         return tb.build()
     }
 
@@ -346,23 +324,22 @@ class ProcessService : Service() {
         val music = spec.audioUri
         val keepOriginal = music == null || spec.keepOriginalAudio
         val vSeq = EditedMediaItemSequence.withAudioAndVideoFrom(
-            loopedItems(vUri, vDur, spec.targetMs, false, !keepOriginal)
+            loopedItems(vUri, vDur, spec.targetMs, false, !keepOriginal, null)
         )
         val b = if (music != null) {
-            Composition.Builder(vSeq, loopingAudio(music))
+            Composition.Builder(vSeq, loopingAudio(music, fixClip(spec.aClip, durationMs(music))))
         } else {
             Composition.Builder(vSeq)
         }
         b.setTransmuxVideo(fastMode)
-        b.setTransmuxAudio(fastMode && music == null)
+        b.setTransmuxAudio(fastMode && music == null && !spec.seamless)
         return b.build()
     }
 
     private fun audioLoop(spec: JobSpec, fastMode: Boolean): Composition {
         val aUri = spec.audioUri ?: throw IllegalArgumentException("Audio belum dipilih")
-        val aDur = durationMs(aUri)
         val seq = EditedMediaItemSequence.withAudioFrom(
-            loopedItems(aUri, aDur, spec.targetMs, true, false)
+            loopedItems(aUri, durationMs(aUri), spec.targetMs, true, false, spec.aClip)
         )
         return Composition.Builder(seq).setTransmuxAudio(fastMode).build()
     }
@@ -371,10 +348,10 @@ class ProcessService : Service() {
         val a = spec.audioUri ?: throw IllegalArgumentException("Sound 1 belum dipilih")
         val b = spec.audio2Uri ?: throw IllegalArgumentException("Sound 2 belum dipilih")
         val seqA = EditedMediaItemSequence.withAudioFrom(
-            loopedItems(a, durationMs(a), spec.targetMs, true, false)
+            loopedItems(a, durationMs(a), spec.targetMs, true, false, spec.aClip)
         )
         val seqB = EditedMediaItemSequence.withAudioFrom(
-            loopedItems(b, durationMs(b), spec.targetMs, true, false)
+            loopedItems(b, durationMs(b), spec.targetMs, true, false, spec.a2Clip)
         )
         return Composition.Builder(seqA, seqB).build()
     }
@@ -382,18 +359,18 @@ class ProcessService : Service() {
     private fun combine(spec: JobSpec, fastMode: Boolean): Composition {
         val v = spec.videoUri ?: throw IllegalArgumentException("Video belum dipilih")
         val a = spec.audioUri ?: throw IllegalArgumentException("Audio belum dipilih")
-        val vDur = durationMs(v)
-        val aDur = durationMs(a)
+        val vFull = if (spec.vFullMs > 0) spec.vFullMs else durationMs(v)
+        val aFull = durationMs(a)
         val target = when (spec.matchMode) {
-            1 -> vDur
-            2 -> aDur
-            else -> maxOf(vDur, aDur)
+            1 -> vFull
+            2 -> aFull
+            else -> maxOf(vFull, aFull)
         }
         val vSeq = EditedMediaItemSequence.withAudioAndVideoFrom(
-            loopedItems(v, vDur, target, false, !spec.keepOriginalAudio)
+            loopedItems(v, durationMs(v), target, false, !spec.keepOriginalAudio, null)
         )
         val aSeq = EditedMediaItemSequence.withAudioFrom(
-            loopedItems(a, aDur, target, true, false)
+            loopedItems(a, aFull, target, true, false, spec.aClip)
         )
         return Composition.Builder(vSeq, aSeq).setTransmuxVideo(fastMode).build()
     }
@@ -421,24 +398,42 @@ class ProcessService : Service() {
         return (totalBps - spec.audioKbps * 1000.0).coerceAtLeast(150_000.0).toInt()
     }
 
+    // ---------- Pembantu ----------
+
+    private fun fixClip(c: LongArray?, durMs: Long): LongArray? {
+        if (c == null) return null
+        val s = c[0].coerceAtLeast(0L)
+        val e = if (c[1] <= 0L || c[1] > durMs) durMs else c[1]
+        require(e - s >= 500L) { "Bagian yang dipilih terlalu pendek (minimal setengah detik)" }
+        return longArrayOf(s, e)
+    }
+
     private fun loopedItems(
         uri: Uri,
         durMs: Long,
         targetMs: Long,
         audioOnly: Boolean,
-        removeAudio: Boolean
+        removeAudio: Boolean,
+        clip: LongArray?
     ): List<EditedMediaItem> {
         require(durMs > 0) { "Durasi file tidak terbaca" }
+        val c = fixClip(clip, durMs)
+        val cs = c?.get(0) ?: 0L
+        val seg = (c?.get(1) ?: durMs) - cs
+        val count = (targetMs + seg - 1) / seg
+        require(count <= 6000) {
+            "Potongan loop terlalu pendek (${seg / 1000} detik) untuk durasi ini. Pilih durasi lebih pendek."
+        }
         val list = ArrayList<EditedMediaItem>()
         var remaining = targetMs
         while (remaining > 300) {
-            val take = minOf(durMs, remaining)
+            val take = minOf(seg, remaining)
             val mb = MediaItem.Builder().setUri(uri)
-            if (take < durMs) {
+            if (cs > 0L || take < durMs) {
                 mb.setClippingConfiguration(
                     MediaItem.ClippingConfiguration.Builder()
-                        .setStartPositionMs(0)
-                        .setEndPositionMs(take)
+                        .setStartPositionMs(cs)
+                        .setEndPositionMs(cs + take)
                         .build()
                 )
             }
@@ -447,15 +442,21 @@ class ProcessService : Service() {
             if (audioOnly) eb.setRemoveVideo(true)
             list.add(eb.build())
             remaining -= take
-            require(list.size <= 3000) {
-                "File terlalu pendek untuk durasi ini. Pakai file yang lebih panjang."
-            }
         }
         return list
     }
 
-    private fun loopingAudio(uri: Uri): EditedMediaItemSequence {
-        val item = EditedMediaItem.Builder(MediaItem.fromUri(uri)).setRemoveVideo(true).build()
+    private fun loopingAudio(uri: Uri, clip: LongArray?): EditedMediaItemSequence {
+        val mb = MediaItem.Builder().setUri(uri)
+        if (clip != null) {
+            mb.setClippingConfiguration(
+                MediaItem.ClippingConfiguration.Builder()
+                    .setStartPositionMs(clip[0])
+                    .setEndPositionMs(clip[1])
+                    .build()
+            )
+        }
+        val item = EditedMediaItem.Builder(mb.build()).setRemoveVideo(true).build()
         return EditedMediaItemSequence.withAudioFrom(listOf(item))
             .buildUpon()
             .setIsLooping(true)
@@ -484,13 +485,25 @@ class ProcessService : Service() {
         }
     }
 
+    private fun videoHeight(uri: Uri): Int {
+        val r = MediaMetadataRetriever()
+        try {
+            r.setDataSource(this, uri)
+            val w = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
+                ?.toIntOrNull() ?: 0
+            val h = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
+                ?.toIntOrNull() ?: 0
+            val rot = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)
+                ?.toIntOrNull() ?: 0
+            return if (rot == 90 || rot == 270) w else h
+        } finally {
+            r.release()
+        }
+    }
+
     // ---------- Hasil ----------
 
     private fun onExportDone() {
-        if (stage == 1) {
-            startLoopFromClip()
-            return
-        }
         handler.removeCallbacks(poll)
         JobState.percent = 100
         JobState.message = "Menyimpan ke galeri..."
@@ -513,10 +526,6 @@ class ProcessService : Service() {
 
     private fun onExportFailed(e: ExportException) {
         handler.removeCallbacks(poll)
-        if (stage == 1) {
-            finishWithError("Gagal menyiapkan potongan: " + (e.message ?: e.errorCodeName))
-            return
-        }
         val spec = currentSpec
         if (usedFast && spec != null) {
             try {
@@ -554,18 +563,17 @@ class ProcessService : Service() {
         contentResolver.update(uri, done, null, null)
     }
 
-    private fun cleanupClip() {
+    private fun cleanSeg() {
         try {
-            stageClip?.delete()
+            segFile?.delete()
         } catch (_: Exception) {
         }
-        stageClip = null
-        stage = 0
+        segFile = null
     }
 
     private fun finishOk() {
         releaseWake()
-        cleanupClip()
+        cleanSeg()
         transformer = null
         JobState.active = false
         JobState.finished = true
@@ -586,7 +594,7 @@ class ProcessService : Service() {
         transformer = null
         tempFile?.delete()
         tempFile = null
-        cleanupClip()
+        cleanSeg()
         releaseWake()
         JobState.active = false
         JobState.error = msg
@@ -605,7 +613,7 @@ class ProcessService : Service() {
         transformer = null
         tempFile?.delete()
         tempFile = null
-        cleanupClip()
+        cleanSeg()
         releaseWake()
         JobState.active = false
         JobState.error = null
@@ -677,8 +685,8 @@ class ProcessService : Service() {
             JobState.active = false
             JobState.message = "Proses berhenti tiba-tiba"
             tempFile?.delete()
+            cleanSeg()
         }
-        cleanupClip()
         super.onDestroy()
     }
 
